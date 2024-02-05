@@ -106,6 +106,104 @@ class BtcConversionHandler(BaseHandler):
 
 
 # ======================================================================================================================
+#                                        WALLET SERVICE SPECIFIC HANDLERS
+# ======================================================================================================================
+
+
+@dataclass
+class WalletCountHandler(BaseHandler):
+    wallets: WalletRepository
+    successor: ServiceHandler = field(default_factory=EmptyHandler)
+
+    def handle(self, request: ServiceRequest) -> None:
+        api_key = request.get_attribute("api_key")
+
+        if api_key is not None:
+            # print("Counting wallets ")
+            user_wallets = self.wallets.read_user_wallets(api_key)
+            if len(user_wallets) >= 3:
+                raise WalletLimitError(
+                    "Maximum number of wallets reached for this user"
+                )
+        else:
+            request.logs.append("Wallet count skipped, no api_key provided")
+
+        self.successor.handle(request)
+
+
+@dataclass
+class WalletRegistrationHandler(BaseHandler):
+    wallets: WalletRepository
+    successor: ServiceHandler = field(default_factory=EmptyHandler)
+
+    def handle(self, request: ServiceRequest) -> None:
+        api_key = request.get_attribute("api_key")
+
+        if api_key is not None:
+            # print("Creating wallet ")
+            created_wallet = Wallet(
+                user_id=api_key,
+                btc_balance=1.0,  # Initial deposit of 1 BTC
+                wallet_address=uuid4(),
+            )
+            self.wallets.create(created_wallet)
+            request.set_attribute("wallet_id", created_wallet.wallet_address)
+            request.set_attribute("wallet", created_wallet)
+        else:
+            request.logs.append("Wallet Registration skipped, no api_key provided")
+
+        self.successor.handle(request)
+
+
+@dataclass
+class WalletOwnershipHandler(BaseHandler):
+    wallets: WalletRepository
+    successor: ServiceHandler = field(default_factory=EmptyHandler)
+
+    def handle(self, request: ServiceRequest) -> None:
+        api_key = request.get_attribute("api_key")
+        wallet_id = request.get_attribute("wallet_id")
+
+        if api_key is None:
+            request.logs.append("Wallet ownership check skipped, no api_key provided")
+        elif wallet_id is None:
+            request.logs.append("Wallet ownership check skipped, no wallet_id provided")
+        else:
+            # print("Checking wallet ownership ")
+            user_wallets = self.wallets.read_user_wallets(api_key)
+            if wallet_id not in [wallet.wallet_address for wallet in user_wallets]:
+                raise WalletOwnershipError(
+                    f"Wallet with ID '{wallet_id}' does not belong to the user"
+                )
+
+        self.successor.handle(request)
+
+
+@dataclass
+class WalletFetchHandler(BaseHandler):
+    wallets: WalletRepository
+    successor: ServiceHandler = field(default_factory=EmptyHandler)
+
+    def handle(self, request: ServiceRequest) -> None:
+        wallet_id = request.get_attribute("wallet_id")
+
+        if wallet_id is not None:
+            # print("Reading wallet ")
+            try:
+                wallet = self.wallets.read(wallet_id)
+                request.set_attribute("wallet", wallet)
+            except WalletDoesNotExistError as e:
+                raise e
+
+        else:
+            request.logs.append("Wallet fetch skipped, wallet_id was not provided")
+
+        self.successor.handle(request)
+
+
+
+
+# ======================================================================================================================
 #                                      HANDLER CONFIGURATOR BASE CLASS
 # ======================================================================================================================
 
