@@ -414,7 +414,43 @@ class FetchDepositsHandler(BaseHandler):
         self.successor.handle(request)
 
 
+# ======================================================================================================================
+#                                        SYSTEM SERVICE SPECIFIC HANDLERS
+# ======================================================================================================================
 
+
+@dataclass
+class IsAdminHandler(BaseHandler):
+    system: System
+    successor: ServiceHandler = field(default_factory=EmptyHandler)
+
+    def handle(self, request: ServiceRequest) -> None:
+        api_key = request.get_attribute("api_key")
+
+        if api_key is not None:
+            # print("Checking admin key...")
+            if not self.system.get_admin_key() == api_key:
+                raise ForbiddenError("Only admin can access statistics.")
+        else:
+            request.logs.append("admin key validation skipped, no api_key provided")
+
+        self.successor.handle(request)
+
+
+@dataclass
+class GetStatisticsHandler(BaseHandler):
+    system: System
+    transactions: TransactionRepository
+    successor: ServiceHandler = field(default_factory=EmptyHandler)
+
+    def handle(self, request: ServiceRequest) -> None:
+        total_transactions = len(self.transactions.read_all())
+        platform_profit = self.system.get_platform_profit()
+
+        request.set_attribute("total_transactions", total_transactions)
+        request.set_attribute("platform_profit", platform_profit)
+
+        self.successor.handle(request)
 
 
 # ======================================================================================================================
