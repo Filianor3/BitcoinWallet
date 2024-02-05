@@ -201,6 +201,220 @@ class WalletFetchHandler(BaseHandler):
         self.successor.handle(request)
 
 
+# ======================================================================================================================
+#                                      TRANSACTION SERVICE SPECIFIC HANDLERS
+# ======================================================================================================================
+
+
+@dataclass
+class FeeHandler(BaseHandler):
+    wallets: WalletRepository
+    successor: ServiceHandler = field(default_factory=EmptyHandler)
+
+    def handle(self, request: ServiceRequest) -> None:
+        sender_wallet_id = request.get_attribute("sender_wallet_id")
+        recipient_wallet_id = request.get_attribute("recipient_wallet_id")
+        api_key = request.get_attribute("api_key")
+
+        if any(
+            attr is None for attr in [sender_wallet_id, recipient_wallet_id, api_key]
+        ):
+            request.logs.append("Fee calculation skipped, missing required attributes")
+        else:
+            user_wallets = self.wallets.read_user_wallets(api_key)
+
+            if sender_wallet_id not in [
+                wallet.wallet_address for wallet in user_wallets
+            ]:
+                raise WalletOwnershipError("Sender wallet does not belong to the user")
+
+            if recipient_wallet_id not in [
+                wallet.wallet_address for wallet in user_wallets
+            ]:
+                request.set_attribute("fee", 0.015)
+            else:
+                request.set_attribute("fee", 0)
+
+        self.successor.handle(request)
+
+
+@dataclass
+class WalletExistenceHandler(BaseHandler):
+    wallets: WalletRepository
+    successor: ServiceHandler = field(default_factory=EmptyHandler)
+
+    def handle(self, request: ServiceRequest) -> None:
+        sender_wallet_id = request.get_attribute("sender_wallet_id")
+        recipient_wallet_id = request.get_attribute("recipient_wallet_id")
+
+        if sender_wallet_id is None or recipient_wallet_id is None:
+            request.logs.append(
+                "Wallet existence check skipped, wallet_ids not provided"
+            )
+        else:
+            try:
+                sender_wallet = self.wallets.read(sender_wallet_id)
+            except WalletDoesNotExistError as e:
+                request.logs.append("Sender wallet does not exist")
+                raise WalletDoesNotExistError("Sender wallet does not exist") from e
+
+            try:
+                recipient_wallet = self.wallets.read(recipient_wallet_id)
+            except WalletDoesNotExistError as e:
+                request.logs.append("Recipient wallet does not exist")
+                raise WalletDoesNotExistError("Recipient wallet does not exist") from e
+
+            request.set_attribute("sender_wallet", sender_wallet)
+            request.set_attribute("recipient_wallet", recipient_wallet)
+
+        self.successor.handle(request)
+
+
+@dataclass
+class BalanceCheckHandler(BaseHandler):
+    successor: ServiceHandler = field(default_factory=EmptyHandler)
+
+    def handle(self, request: ServiceRequest) -> None:
+        sender_wallet = request.get_attribute("sender_wallet")
+        amount_btc = request.get_attribute("amount_btc")
+        fee = request.get_attribute("fee")
+        if fee is None:
+            fee = 0
+
+        if sender_wallet is None or amount_btc is None:
+            request.logs.append("Balance check skipped, missing required attributes")
+        else:
+            if amount_btc < 0:
+                raise BadRequestError("Negative transaction amount")
+            if sender_wallet.btc_balance < amount_btc * (1 + fee):
+                raise InsufficientBalanceError(
+                    "Insufficient balance in the sender's wallet"
+                )
+
+        self.successor.handle(request)
+
+
+@dataclass
+class TransactionExecutionHandler(BaseHandler):
+    wallets: WalletRepository
+    transactions: TransactionRepository
+    system: System
+    successor: ServiceHandler = field(default_factory=EmptyHandler)
+
+    def handle(self, request: ServiceRequest) -> None:
+        sender_wallet = request.get_attribute("sender_wallet")
+        recipient_wallet = request.get_attribute("recipient_wallet")
+        amount_btc = request.get_attribute("amount_btc")
+        fee = request.get_attribute("fee")
+
+        if (
+            sender_wallet is None
+            or recipient_wallet is None
+            or amount_btc is None
+            or fee is None
+        ):
+            request.logs.append(
+                "Transaction execution skipped, missing required attributes"
+            )
+            self.successor.handle(request)
+            return
+
+        if len(request.logs) > 0:
+            request.logs.append(
+                "Transaction execution aborted, errors in previous steps"
+            )
+            self.successor.handle(request)
+            return
+
+        sender_wallet.btc_balance -= amount_btc * (1 + fee)
+        recipient_wallet.btc_balance += amount_btc
+
+        self.wallets.update(sender_wallet)
+        self.wallets.update(recipient_wallet)
+
+        transaction = Transaction(
+            transaction_id=uuid4(),
+            sender_wallet_id=sender_wallet.wallet_address,
+            recipient_wallet_id=recipient_wallet.wallet_address,
+            amount_btc=amount_btc,
+            fee=fee,
+            timestamp=datetime.utcnow(),
+        )
+
+        if fee > 0:
+            profit = fee * amount_btc
+            self.system.add_profitable_transaction(transaction.transaction_id, profit)
+
+        self.transactions.create(transaction)
+        request.set_attribute("transaction", transaction)
+
+        self.successor.handle(request)
+
+
+@dataclass
+class WalletAddressesHandler(BaseHandler):
+    wallets: WalletRepository
+    successor: ServiceHandler = field(default_factory=EmptyHandler)
+
+    def handle(self, request: ServiceRequest) -> None:
+        api_key = request.get_attribute("api_key")
+
+        if api_key is None:
+            request.logs.append(
+                "Wallet addresses retrieval skipped, no api_key provided"
+            )
+        else:
+            user_wallets = self.wallets.read_user_wallets(api_key)
+            wallet_addresses = [wallet.wallet_address for wallet in user_wallets]
+            request.set_attribute("wallet_ids", wallet_addresses)
+
+        self.successor.handle(request)
+
+
+@dataclass
+class FetchWithdrawalsHandler(BaseHandler):
+    transactions: TransactionRepository
+    successor: ServiceHandler = field(default_factory=EmptyHandler)
+
+    def handle(self, request: ServiceRequest) -> None:
+        wallet_ids = request.get_attribute("wallet_ids")
+        if wallet_ids is None:
+            request.logs.append(
+                "Fetching withdrawals skipped, missing required wallet_ids"
+            )
+        else:
+            transactions = request.get_attribute("performed_transactions") or []
+
+            for wallet_id in wallet_ids:
+                transactions += self.transactions.read_wallet_withdrawals(wallet_id)
+
+            request.set_attribute("performed_transactions", transactions)
+
+        self.successor.handle(request)
+
+
+@dataclass
+class FetchDepositsHandler(BaseHandler):
+    transactions: TransactionRepository
+    successor: ServiceHandler = field(default_factory=EmptyHandler)
+
+    def handle(self, request: ServiceRequest) -> None:
+        wallet_ids = request.get_attribute("wallet_ids")
+        if wallet_ids is None:
+            request.logs.append(
+                "Fetching deposits skipped, missing required wallet_ids"
+            )
+        else:
+            transactions = request.get_attribute("performed_transactions") or []
+
+            for wallet_id in wallet_ids:
+                transactions += self.transactions.read_wallet_deposits(wallet_id)
+            request.set_attribute("performed_transactions", transactions)
+
+        self.successor.handle(request)
+
+
+
 
 
 # ======================================================================================================================
